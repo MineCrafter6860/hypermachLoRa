@@ -1,5 +1,5 @@
 // ============================================================
-// E22-900T30D  —  TRANSMITTER (Pico / arduino-pico)
+// E22-900T30D  —  TRANSMITTER 
 // TEKNOFEST HYİ Protocol — 78-byte binary packet
 //
 // UART0 : GP0=TX  GP1=RX   (Serial1) — E22 LoRa
@@ -15,6 +15,30 @@
 #include <math.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
+
+// ============================================================
+// HUMAN-READABLE CONFIGURATION
+// ============================================================
+struct LoRaSettings {
+  uint16_t address;     // Module Address (0 to 65535)
+  uint8_t  netID;       // Network ID (0 to 255)
+  uint8_t  channel;     // Frequency Channel (0 to 83)
+  uint32_t baudRate;    // UART Baud: 9600, 19200, 115200, etc.
+  uint8_t  airDataRate; // Air kbps: 2 (for 2.4k), 9 (for 9.6k), etc.
+  uint8_t  txPower;     // Power dBm: 30, 27, 24, 21
+  bool     fixedMode;   // true = Fixed Mode, false = Transparent
+};
+
+// Edit these values to quickly change your setup:
+LoRaSettings myConfig = {
+  .address     = 0x0001,   // Set to 0x0002 for the Receiver[cite: 2]
+  .netID       = 0x00,     // Network ID[cite: 1, 2]
+  .channel     = 18,        // <--- CHANGE CHANNEL HERE
+  .baudRate    = 115200,   // Match your Serial1.begin() speed[cite: 1]
+  .airDataRate = 2,        // 2.4kbps (standard for range)[cite: 1, 2]
+  .txPower     = 30,       // Maximum power (30dBm)[cite: 1]
+  .fixedMode   = true      // Required for targeted transmission[cite: 1]
+};
 
 // ---- Pin definitions ---------------------------------------
 #define PIN_M0        2
@@ -211,29 +235,66 @@ bool sendConfig(const byte* cmd, int len) {
 }
 
 void configureModule() {
-  Serial.println("[CFG] Entering config mode...");
-  setMode(true, false);
+  Serial.println("[CFG] Applying Human-Readable Settings...");
+  setMode(true, false); // Switch to Configuration Mode (M1=1, M0=0)
   delay(100);
   while (Serial1.available()) Serial1.read();
 
-  byte cmd1[] = {0xC0, 0x00, 0x04, 0x00, 0x00, 0x00, 0x62};
-  Serial.println(sendConfig(cmd1, sizeof(cmd1))
-                 ? "[CFG] Address/REG0 OK" : "[CFG] Address/REG0 FAIL");
+  // 1. Calculate Register Bytes
+  uint8_t addh = (myConfig.address >> 8) & 0xFF;
+  uint8_t addl = myConfig.address & 0xFF;
 
-  byte cmd2[] = {0xC0, 0x04, 0x01, 0x00};
-  Serial.println(sendConfig(cmd2, sizeof(cmd2))
-                 ? "[CFG] REG1 OK" : "[CFG] REG1 FAIL");
+  // FIX BUG 1: Proper Baud Rate & Air Data Rate Mapping
+  uint8_t reg0_baud;
+  switch (myConfig.baudRate) {
+    case 1200:   reg0_baud = 0x00; break;
+    case 2400:   reg0_baud = 0x01; break;
+    case 4800:   reg0_baud = 0x02; break;
+    case 9600:   reg0_baud = 0x03; break;
+    case 19200:  reg0_baud = 0x04; break;
+    case 38400:  reg0_baud = 0x05; break;
+    case 57600:  reg0_baud = 0x06; break;
+    case 115200: reg0_baud = 0x07; break;
+    default:     reg0_baud = 0x03; // Default 9600
+  }
 
-  byte cmd3[] = {0xC0, 0x05, 0x01, 0x07};
-  Serial.println(sendConfig(cmd3, sizeof(cmd3))
-                 ? "[CFG] Channel OK" : "[CFG] Channel FAIL");
+  uint8_t reg0_air;
+  switch (myConfig.airDataRate) {
+    case 0:  reg0_air = 0x00; break; // 0.3k
+    case 1:  reg0_air = 0x01; break; // 1.2k
+    case 2:  reg0_air = 0x02; break; // 2.4k
+    case 4:  reg0_air = 0x03; break; // 4.8k
+    case 9:  reg0_air = 0x04; break; // 9.6k
+    case 19: reg0_air = 0x05; break; // 19.2k
+    case 38: reg0_air = 0x06; break; // 38.4k
+    case 62: reg0_air = 0x07; break; // 62.5k
+    default: reg0_air = 0x02; // Default 2.4k
+  }
+  uint8_t reg0 = (reg0_baud << 5) | (0x00 << 3) | reg0_air; // 8N1 parity
 
-  byte cmd4[] = {0xC0, 0x06, 0x01, 0x4B};
-  Serial.println(sendConfig(cmd4, sizeof(cmd4))
-                 ? "[CFG] REG3 OK" : "[CFG] REG3 FAIL");
+  // Map Power (bits 1-0)
+  uint8_t reg1_pwr = (myConfig.txPower == 30) ? 0x00 : 
+                     (myConfig.txPower == 27) ? 0x01 :
+                     (myConfig.txPower == 24) ? 0x02 : 0x03;
+  uint8_t reg1 = (0x00 << 6) | reg1_pwr; // 240-byte packet size
 
-  Serial.println("[CFG] Done. Switching to Normal mode.");
-  setMode(false, false);
+  // Map Fixed Mode (bit 6)
+  uint8_t reg3 = (myConfig.fixedMode ? 0x01 : 0x00) << 6 | 0x0B; // Default RSSI off, LBT off
+
+  // 2. Send Commands
+  byte cmd1[] = {0xC0, 0x00, 0x04, addh, addl, myConfig.netID, reg0};
+  sendConfig(cmd1, sizeof(cmd1));
+
+  byte cmd2[] = {0xC0, 0x04, 0x01, reg1};
+  sendConfig(cmd2, sizeof(cmd2));
+
+  byte cmd3[] = {0xC0, 0x05, 0x01, myConfig.channel};
+  sendConfig(cmd3, sizeof(cmd3));
+
+  byte cmd4[] = {0xC0, 0x06, 0x01, reg3};
+  sendConfig(cmd4, sizeof(cmd4));
+
+  setMode(false, false); // Return to Normal Mode (M1=0, M0=0)
   delay(100);
 }
 
@@ -273,6 +334,7 @@ void setup() {
   calibratePadAltitude();
   configureModule();
 
+  Serial1.begin(myConfig.baudRate); // Re-initialize Pico's UART to match the E22's new baud rate
   Serial.println("[TX] Hazir. HYI paketi gonderiliyor...");
 }
 
@@ -337,11 +399,11 @@ void loop() {
   packet[76] = 0x0D;
   packet[77] = 0x0A;
 
-  // ---- Transmit over LoRa ----------------------------------
+// ---- Transmit over LoRa ----------------------------------
   waitAUX();
-  Serial1.write((byte)0x00); // Target ADDH
-  Serial1.write((byte)0x02); // Target ADDL
-  Serial1.write((byte)0x07); // Target channel
+  Serial1.write((byte)0x00);         
+  Serial1.write((byte)0x02);         
+  Serial1.write(myConfig.channel);   // <--- FIXED: Now matches your struct (18)
   Serial1.write(packet, PACKET_SIZE);
   waitAUX();
 
